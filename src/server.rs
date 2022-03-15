@@ -1,26 +1,20 @@
-use std::{
-    collections::HashMap,
-    net::{SocketAddr, TcpListener, TcpStream},
-};
+use std::{collections::HashMap, net::SocketAddr};
 
-use async_dup::Arc;
-use smol::{
-    channel::{bounded, Receiver, Sender},
+use tokio::{
     io::{self, AsyncBufReadExt, AsyncWriteExt},
-    stream::StreamExt,
-    Async,
+    net, sync,
 };
 
 enum Event {
-    Join(SocketAddr, Arc<Async<TcpStream>>),
+    Join(SocketAddr, net::tcp::OwnedWriteHalf),
     Leave(SocketAddr),
     Message(SocketAddr, String),
 }
 
-async fn dispatch(receiver: Receiver<Event>) -> io::Result<()> {
-    let mut map = HashMap::<SocketAddr, Arc<Async<TcpStream>>>::new();
+async fn dispatch(mut receiver: sync::mpsc::Receiver<Event>) -> io::Result<()> {
+    let mut map = HashMap::<SocketAddr, net::tcp::OwnedWriteHalf>::new();
 
-    while let Ok(event) = receiver.recv().await {
+    while let Some(event) = receiver.recv().await {
         let (addr, output) = match event {
             Event::Join(addr, stream) => {
                 map.insert(addr, stream);
@@ -36,7 +30,7 @@ async fn dispatch(receiver: Receiver<Event>) -> io::Result<()> {
         print!("{}", output);
 
         for stream in map.values_mut() {
-            if stream.get_ref().peer_addr()? != addr {
+            if stream.peer_addr()? != addr {
                 stream.write_all(output.as_bytes()).await.ok();
             }
         }
@@ -44,39 +38,38 @@ async fn dispatch(receiver: Receiver<Event>) -> io::Result<()> {
     Ok(())
 }
 
-async fn read_message(sender: Sender<Event>, client: Arc<Async<TcpStream>>) -> io::Result<()> {
-    let addr = client.get_ref().peer_addr()?;
+async fn read_message(
+    sender: sync::mpsc::Sender<Event>,
+    client: net::tcp::OwnedReadHalf,
+) -> io::Result<()> {
+    let addr = client.peer_addr()?;
     let mut lines = io::BufReader::new(client).lines();
 
-    while let Some(line) = lines.next().await {
-        let line = line?;
+    while let Some(line) = lines.next_line().await? {
         sender.send(Event::Message(addr, line)).await.ok();
     }
     Ok(())
 }
 
-fn main() -> io::Result<()> {
-    smol::block_on(async {
-        // listen
-        let listener = Async::<TcpListener>::bind(([127, 0, 0, 1], 6000))?;
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> io::Result<()> {
+    // listen
+    // let listener = Async::<TcpListener>::bind(([127, 0, 0, 1], 6000))?;
+    let listener = net::TcpListener::bind("127.0.0.1:6000").await?;
 
-        let (sender, receiver) = bounded(100);
+    let (sender, receiver) = sync::mpsc::channel(100);
 
-        smol::spawn(dispatch(receiver)).detach();
+    tokio::spawn(dispatch(receiver));
 
-        loop {
-            let (stream, addr) = listener.accept().await?;
-            let client = Arc::new(stream);
-            let sender = sender.clone();
+    loop {
+        let (stream, addr) = listener.accept().await?;
+        let sender = sender.clone();
 
-            smol::spawn(async move {
-                sender.send(Event::Join(addr, client.clone())).await.ok();
-
-                read_message(sender.clone(), client).await.ok();
-
-                sender.send(Event::Leave(addr)).await.ok();
-            })
-            .detach();
-        }
-    })
+        tokio::spawn(async move {
+            let (rx, tx) = stream.into_split();
+            sender.send(Event::Join(addr, tx)).await.ok();
+            read_message(sender.clone(), rx).await.ok();
+            sender.send(Event::Leave(addr)).await.ok();
+        });
+    }
 }
